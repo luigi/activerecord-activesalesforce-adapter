@@ -15,7 +15,7 @@
   limitations under the License.
 =end
 
-require 'asf_adapter'
+require 'activesalesforce_adapter'
 
 module ActionView
   module Helpers
