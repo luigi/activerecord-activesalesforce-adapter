@@ -31,7 +31,6 @@ require File.dirname(__FILE__) + '/id_resolver'
 require File.dirname(__FILE__) + '/sid_authentication_filter'
 require File.dirname(__FILE__) + '/recording_binding'
 require File.dirname(__FILE__) + '/result_array'
- 
 
 module ActiveRecord    
   class Base   
@@ -109,6 +108,21 @@ module ActiveRecord
       ConnectionAdapters::SalesforceAdapter.new(binding, logger, config)
 
     end
+    
+    class << self
+      alias :old_compute_table_name :compute_table_name
+    end
+    
+    # Adds table name computation support for Rails 3
+    def self.compute_table_name
+      if self.connection.adapter_name == 'ActiveSalesforce'
+        base = base_class
+        (base == self) ? base.name.demodulize.capitalize : base.table_name
+      else
+        old_compute_table_name
+      end
+    end
+    
   end
   
   
@@ -133,29 +147,36 @@ module ActiveRecord
         
         @command_boxcar = []
         @class_to_entity_map = {}
+        
+        class_to_entity = config[:class_to_entity]
+        class_to_entity.each { |k, v| @class_to_entity_map[k] = v } if class_to_entity
+        
+        @defaultModule = config[:defaultModule]
+        debug "Using default module #{@defaultModule}" if @defaultModule
+        
       end
       
       
       def set_class_for_entity(klass, entity_name)
-        debug("Setting @class_to_entity_map['#{entity_name.upcase}'] = #{klass} for connection #{self}")
         @class_to_entity_map[entity_name.upcase] = klass
       end
-      
       
       def binding
         @connection
       end
-      
-      
+            
       def adapter_name #:nodoc:
         'ActiveSalesforce'
       end
-      
-      
+
       def supports_migrations? #:nodoc:
         false
       end
       
+      # Added support for Rails 3
+      def tables
+        @connection.describeGlobal({}).describeGlobalResponse.result.types
+      end
       
       # QUOTING ==================================================
             
@@ -280,7 +301,7 @@ module ActiveRecord
         if selectCountMatch
           soql = "SELECT COUNT() FROM#{selectCountMatch.post_match}"
         else 
-          if sql.match(/SELECT\s+\*\s+FROM/mi)
+          if sql.match(/SELECT\s+\*\s+FROM/mi) || sql.match(/SELECT\s+.+\.\*\s+FROM/mi)
             # Always convert SELECT * to select all columns (required for the AR attributes mechanism to work correctly)
             soql = sql.sub(/SELECT .+ FROM/mi, "SELECT #{column_names.join(', ')} FROM")
           else
@@ -320,6 +341,7 @@ module ActiveRecord
           @connection.batch_size = @batch_size if @batch_size
           @batch_size = nil
           
+          debug("Running query #{soql}.")
           query_result = get_result(@connection.query(:queryString => soql), :query)
           result = ActiveSalesforce::ResultArray.new(query_result[:size].to_i)
           return result unless query_result[:records]
@@ -592,10 +614,8 @@ module ActiveRecord
         result
       end
       
-      
       def get_entity_def(entity_name)
-        cached_entity_def = @entity_def_map[entity_name]
-        
+        cached_entity_def = @entity_def_map[entity_name]        
         if cached_entity_def
           # Check for the loss of asf AR setup 
           entity_klass = class_from_entity_name(entity_name)
@@ -684,16 +704,16 @@ module ActiveRecord
             end
             
             # Handle references to custom objects
-            reference_to = reference_to.chomp("__c").capitalize if reference_to.match(/__c$/)
-            
+            if reference_to.match(/__c$/) && !@class_to_entity_map[reference_to.upcase]
+              reference_to = reference_to.chomp("__c").capitalize 
+            end
             begin
-              referenced_klass = class_from_entity_name(reference_to)
+              referenced_klass = class_from_entity_name(reference_to)            
             rescue NameError => e
                 # Automatically create a least a stub for the referenced entity
                 debug("   Creating ActiveRecord stub for the referenced entity '#{reference_to}'")
                 
                 referenced_klass = klass.class_eval("::#{reference_to} = Class.new(ActiveRecord::Base)")
-                
                 # Automatically inherit the connection from the referencee
                 referenced_klass.connection = klass.connection
             end
@@ -720,12 +740,8 @@ module ActiveRecord
       
       
       def class_from_entity_name(entity_name)
-        entity_klass = @class_to_entity_map[entity_name.upcase]
-        debug("Found matching class '#{entity_klass}' for entity '#{entity_name}'") if entity_klass
-        
-        entity_klass = entity_name.constantize unless entity_klass
-        
-        entity_klass
+        entity_klass_name = @class_to_entity_map[entity_name.upcase] || entity_name
+        entity_klass = @defaultModule.empty? ? entity_klass_name.constantize : [@defaultModule, entity_klass_name].join('::').constantize
       end
       
       
@@ -759,8 +775,9 @@ module ActiveRecord
         
         # See if a table name to AR class mapping was registered
         klass = @class_to_entity_map[table_name.upcase]
+        entity_name = (klass || raw_table_name.match(/.*__c$/)) ? raw_table_name : table_name.camelize
+        # entity_name = klass || table_name.camelize
         
-        entity_name = klass ? raw_table_name : table_name.camelize
         entity_def = get_entity_def(entity_name)
         
         [table_name, entity_def.columns, entity_def]
